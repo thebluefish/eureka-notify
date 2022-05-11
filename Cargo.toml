@@ -1,0 +1,19 @@
+[package]
+name = "eureka-notify"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+derive_more = "0.99"
+tokio = { version = "1", features = ["full"] }
+serenity = { version="0.11", default-features=false, features=["builder", "client", "gateway", "rustls_backend", "model", "utils", "cache"] }
+chrono = "0.4"
+anyhow = "1.0"
+serde="1.0"
+serde_json = "1.0"
+lazy_static = "1.4"
+newtype-ops = "0.1.4"
+tracing = "0.1"
+tracing-subscriber = "0.2"
+pickledb = "0.5"
+dotenv = "0.15"
