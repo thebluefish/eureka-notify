@@ -36,19 +36,20 @@ impl EventHandler for Handler {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt::init();
+    tracing_subscriber::fmt().with_max_level(Level::INFO).init();
 
     // Optionally load the .env file
     if let Err(e) = dotenv::dotenv() {
         error!("failed to load .env file: {e}");
     }
 
-
     let mut client = Client::builder(&*DISCORD_TOKEN, GatewayIntents::GUILD_MESSAGES)
         .event_handler(Handler(false.into()))
         .await
         .expect("Failed to create client")
         ;
+
+    info!("Initializing discord client");
 
     if let Err(why) = client.start().await {
         println!("Client error: {:?}", why);
@@ -60,6 +61,8 @@ async fn run_main_loop(ctx: Context) {
     let pagos = EorzeaMap::from_name("Eureka Pagos").expect("Could not find map");
     let pyros = EorzeaMap::from_name("Eureka Pyros").expect("Could not find map");
     let hydatos = EorzeaMap::from_name("Eureka Hydatos").expect("Could not find map");
+
+    info!("Starting main loop");
 
     let mut now = EorzeaDateTime::now().truncated(Duration::hours(8));
     loop {
@@ -112,6 +115,9 @@ async fn run_main_loop(ctx: Context) {
                     })
             })
             .await;
+
+        info!("Completed tick for {}", now.to_utc());
+
         if let Err(why) = message {
             eprintln!("Error sending message: {:?}", why);
         };
