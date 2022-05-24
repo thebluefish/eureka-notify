@@ -10,7 +10,7 @@ const DAY: f64 = HOUR * 24.;
 
 /// A DateTime aware of Eorzean time scale
 /// Provides utility for conversion with other timezones
-#[derive(Display, Deref, DerefMut, Copy, Clone, Eq, PartialEq, Debug, Hash)]
+#[derive(Display, Deref, DerefMut, Copy, Clone, Eq, PartialEq, Debug, Hash, Ord, PartialOrd)]
 pub struct EorzeaDateTime(pub NaiveDateTime);
 
 // Auto-forwards ops for wrapped type
@@ -20,6 +20,10 @@ impl EorzeaDateTime {
     /// Get the current Eorzean date & time
     pub fn now() -> Self {
         EorzeaDateTime(NaiveDateTime::from_timestamp((Utc::now().timestamp() as f64 * EORZEA_TIME_RATIO)  as i64, 0))
+    }
+
+    pub fn from_timestamp(timestamp: i64) -> Self {
+        EorzeaDateTime(NaiveDateTime::from_timestamp(timestamp, 0))
     }
 
     /// Converts to UTC time
