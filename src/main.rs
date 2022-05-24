@@ -1,32 +1,55 @@
-use eureka_notify::prelude::*;
+use std::collections::HashMap;
 use std::env;
 use std::fmt::{Display, Formatter};
 use std::sync::atomic::{AtomicBool, Ordering};
+
 use chrono::{Duration, Utc};
 use chrono_humanize::HumanTime;
 use derive_more::{Deref, DerefMut};
+use lazy_static::lazy_static;
+use notify_rust::Notification;
+use pickledb::{PickleDb, PickleDbDumpPolicy, SerializationMethod};
+use serenity::async_trait;
+use serenity::framework::standard::{
+    Args,
+    CommandGroup,
+    CommandOptions,
+    CommandResult,
+    DispatchError,
+    help_commands,
+    HelpOptions,
+    Reason,
+    StandardFramework,
+};
+use serenity::framework::standard::buckets::{LimitedFor, RevertBucket};
+use serenity::framework::standard::macros::{check, command, group, help, hook};
+use serenity::model::gateway::Ready;
+use serenity::model::id::ChannelId;
+use serenity::model::prelude::*;
+use serenity::prelude::*;
+use serenity::utils::{content_safe, ContentSafeOptions};
 use tokio::time::sleep;
 use tracing::*;
 use tracing_subscriber;
-use serenity::async_trait;
-use serenity::prelude::*;
-use serenity::model::prelude::*;
-use serenity::model::gateway::Ready;
-use serenity::model::id::ChannelId;
 
-use lazy_static::lazy_static;
-use pickledb::{PickleDb, PickleDbDumpPolicy, SerializationMethod};
-use notify_rust::Notification;
+use eureka_notify::prelude::*;
 
 // Globals loaded from environment vars
 lazy_static! {
     pub static ref DISCORD_TOKEN: String = env::var("DISCORD_TOKEN").expect("Expected DISCORD_TOKEN in env");
-    pub static ref CHANNEL_ID: u64 = env::var("CHANNEL_ID").expect("Expected CHANNEL_ID in env").parse().expect("Invalid CHANNEL_ID");
-    pub static ref NOTIFICATION_ROLE_ID: u64 = env::var("NOTIFICATION_ROLE_ID").expect("Expected NOTIFICATION_ROLE_ID in env").parse().expect("Invalid NOTIFICATION_ROLE_ID");
+    pub static ref DB: Mutex<PickleDb> = Mutex::new(PickleDb::load("data.db", PickleDbDumpPolicy::DumpUponRequest, SerializationMethod::Json).unwrap_or_else(|_| PickleDb::new("data.db", PickleDbDumpPolicy::DumpUponRequest, SerializationMethod::Json)));
+    // pub static ref NOTIFICATION_ROLE_ID: u64 = env::var("NOTIFICATION_ROLE_ID").expect("Expected NOTIFICATION_ROLE_ID in env").parse().expect("Invalid NOTIFICATION_ROLE_ID");
+    // pub static ref CHANNEL_ID: u64 = env::var("CHANNEL_ID").expect("Expected CHANNEL_ID in env").parse().expect("Invalid CHANNEL_ID");
 }
 
 #[derive(Default, Deref, DerefMut)]
 struct Handler(AtomicBool);
+
+#[derive(serde::Serialize, serde::Deserialize, Debug)]
+pub struct GuildItem {
+    ping_id: Option<u64>,
+    posts: Vec<(u64, i64)>,
+}
 
 enum TimeSleep {
     OneCycle,
@@ -58,6 +81,42 @@ impl EventHandler for Handler {
     }
 }
 
+#[group]
+// This requires us to call commands in this group
+#[prefixes("ross", "br")]
+#[only_in(guilds)]
+#[summary = "Ross commands"]
+// Sets a command that will be executed if only a group-prefix was passed.
+#[commands(cat, dog)]
+struct Ross;
+
+#[command]
+#[description = "Sets the ID to ping on near-future events"]
+#[bucket = "ross"]
+#[sub_commands(sub)]
+#[required_permissions("ADMINISTRATOR")]
+async fn ping(ctx: &Context, msg: &Message) -> CommandResult {
+    msg.react("white_check_mark");
+    Ok(())
+}
+
+#[command("set")]
+#[description("Sets the ID to ping")]
+async fn ping_set(ctx: &Context, msg: &Message, _args: Args) -> CommandResult {
+    msg.reply(&ctx.http, "This is a sub function!").await?;
+
+    Ok(())
+}
+
+#[command("stop")]
+#[aliases("clear", "remove")]
+#[description("Clears the ping ID, stopping the bot from pinging anyone")]
+async fn ping_clear(ctx: &Context, msg: &Message, _args: Args) -> CommandResult {
+    msg.reply(&ctx.http, "This is a sub function!").await?;
+
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt().with_max_level(Level::INFO).init();
@@ -83,30 +142,27 @@ async fn main() -> anyhow::Result<()> {
 async fn run_main_loop(ctx: Context) {
     info!("Starting main loop");
 
-    let mut db = PickleDb::load("data.db", PickleDbDumpPolicy::DumpUponRequest, SerializationMethod::Json).unwrap_or_else(|_| PickleDb::new("data.db", PickleDbDumpPolicy::DumpUponRequest, SerializationMethod::Json));
-
     // Start either where we left off previously or now
     let mut skip_first_tick = false;
     let mut now = EorzeaDateTime::now().truncated(Duration::hours(8));
     let catch_up = now;
-    if let Some(db_now) = db.get("now") {
+    if let Some(db_now) = DB.lock().await.get("now") {
         if db_now < now.timestamp() {
             now = EorzeaDateTime::from_timestamp(db_now) + Duration::hours(8);
-        }
-        else { // if we already ran the current frame, sleep until the next one
+        } else { // if we already ran the current frame, sleep until the next one
             skip_first_tick = true;
         }
     }
 
-    let mut past_posts = db.get("posts").unwrap_or(Vec::<(u64, i64)>::new());
+    let mut guilds: HashMap<u64, GuildItem> = DB.lock().await.get("posts").unwrap_or(HashMap::new());
 
     loop {
         let future = now + Duration::hours(8);
 
-        let crab = speed_belt(now);
+        let crab = crab_status(now);
         let crabb = if crab == future { Some(crab) } else { None };
 
-        let cassie = cassie_earring(now);
+        let cassie = cassie_status(now);
         let cassiee = if cassie == future { Some(cassie) } else { None };
 
         // let (hotbox, hotbox_count) = hotbox_farm(now);
@@ -118,26 +174,29 @@ async fn run_main_loop(ctx: Context) {
         if skip_first_tick {
             info!("skipping same tick");
             skip_first_tick = false;
-        }
-        else {
-            // Post updates
-            let post_id = post_discord(&ctx, now).await;
+        } else {
+            for (guild_id, GuildItem { ping_id, mut posts }) in guilds {
 
-            // Send notifications for up to 1 weather cycle
-            if future > catch_up && (crabb.is_some() || cassiee.is_some()/* || hotboxx.is_some() || offensivee.is_some()*/) {
-                notify_os(TimeSleep::OneCycle, crabb, cassiee/*, hotboxx, offensivee*/);
+                // Post updates
+                let post_id = post_discord(&ctx, now).await;
+
+                // Send notifications for up to 1 weather cycle
+                if future > catch_up && (crabb.is_some() || cassiee.is_some()/* || hotboxx.is_some() || offensivee.is_some()*/) {
+                    notify_os(TimeSleep::OneCycle, crabb, cassiee/*, hotboxx, offensivee*/);
+                }
+
+                // Clean up historical posts
+                for (id, timestamp) in posts.drain(..) {
+                    edit_post(&ctx, id, EorzeaDateTime::from_timestamp(timestamp)).await;
+                }
+
+                // Push this post to history
+                if let Some(id) = post_id {
+                    posts.push((id, now.timestamp()));
+                }
             }
 
-            // Clean up historical posts
-            for (id, timestamp) in past_posts.drain(..) {
-                edit_post(&ctx, id, EorzeaDateTime::from_timestamp(timestamp)).await;
-            }
-
-            // Push this post to history
-            if let Some(id) = post_id {
-                past_posts.push((id, now.timestamp()));
-            }
-
+            let mut db = DB.lock().await;
             db.set("posts", &past_posts).unwrap();
             db.set("now", &(now.timestamp())).unwrap();
             db.dump().expect("failed to save db");
@@ -186,14 +245,14 @@ pub async fn edit_post(ctx: &Context, id: u64, now: EorzeaDateTime) {
     let future = now + Duration::hours(8);
 
     // We will post the next crab timer when this is crab weather *or* crab weather is next
-    let crab_time = speed_belt(now);
-    let crab = if speed_belt(past) == now || crab_time == future { Some(crab_time) } else { None };
+    let crab_time = crab_status(now);
+    let crab = if crab_status(past) == now || crab_time == future { Some(crab_time) } else { None };
 
-    let cassie_time = cassie_earring(now);
-    let cassie = if cassie_earring(past) == now || cassie_time == future { Some(cassie_time) } else { None };
+    let cassie_time = cassie_status(now);
+    let cassie = if cassie_status(past) == now || cassie_time == future { Some(cassie_time) } else { None };
 
-    let past_crab = speed_belt(past) == now;
-    let past_cassie = cassie_earring(past) == now;
+    let past_crab = crab_status(past) == now;
+    let past_cassie = cassie_status(past) == now;
 
     let result = ChannelId(CHANNEL_ID.clone()).edit_message(&ctx, id, |m| {
         m.content("");
@@ -203,8 +262,7 @@ pub async fn edit_post(ctx: &Context, id: u64, now: EorzeaDateTime) {
                     .field(format!("Crab <t:{}:R>", crab_time.to_utc().timestamp()), format!("<t:{}>", crab_time.to_utc().timestamp()), true)
                     .field(format!("Cassie <t:{}:R>", cassie_time.to_utc().timestamp()), format!("<t:{}>", cassie_time.to_utc().timestamp()), true)
             });
-        }
-        else if crab.is_some() || cassie.is_some() {
+        } else if crab.is_some() || cassie.is_some() {
             m.add_embed(|e| {
                 if let Some(crab) = crab {
                     e.field(format!("Crab <t:{}:R>", crab.to_utc().timestamp()), format!("<t:{}>", crab.to_utc().timestamp()), true);
@@ -238,14 +296,14 @@ pub async fn post_discord(ctx: &Context, now: EorzeaDateTime) -> Option<u64> {
     let future = now + Duration::hours(8);
 
     // We will post the next crab timer when this is crab weather *or* crab weather is next
-    let crab_time = speed_belt(now);
-    let crab = if speed_belt(past) == now || crab_time == future { Some(crab_time) } else { None };
+    let crab_time = crab_status(now);
+    let crab = if crab_status(past) == now || crab_time == future { Some(crab_time) } else { None };
 
-    let cassie_time = cassie_earring(now);
-    let cassie = if cassie_earring(past) == now || cassie_time == future { Some(cassie_time) } else { None };
+    let cassie_time = cassie_status(now);
+    let cassie = if cassie_status(past) == now || cassie_time == future { Some(cassie_time) } else { None };
 
-    let past_crab = speed_belt(past) == now;
-    let past_cassie = cassie_earring(past) == now;
+    let past_crab = crab_status(past) == now;
+    let past_cassie = cassie_status(past) == now;
 
     let message = ChannelId(CHANNEL_ID.clone())
         .send_message(&ctx, |m| {
@@ -259,8 +317,7 @@ pub async fn post_discord(ctx: &Context, now: EorzeaDateTime) -> Option<u64> {
                         .field(format!("Crab <t:{}:R>", crab_time.to_utc().timestamp()), format!("<t:{}>", crab_time.to_utc().timestamp()), true)
                         .field(format!("Cassie <t:{}:R>", cassie_time.to_utc().timestamp()), format!("<t:{}>", cassie_time.to_utc().timestamp()), true)
                 });
-            }
-            else if crab.is_some() || cassie.is_some() {
+            } else if crab.is_some() || cassie.is_some() {
                 m.add_embed(|e| {
                     if let Some(crab) = crab {
                         e.field(format!("Crab <t:{}:R>", crab.to_utc().timestamp()), format!("<t:{}>", crab.to_utc().timestamp()), true);
@@ -293,7 +350,6 @@ pub async fn post_discord(ctx: &Context, now: EorzeaDateTime) -> Option<u64> {
 
 pub async fn notify_discord(ctx: &Context, crab: Option<EorzeaDateTime>, cassie: Option<EorzeaDateTime>,
                             /*hotbox: Option<(EorzeaDateTime, usize)>, offensive: Option<(EorzeaDateTime, usize)>*/) {
-
     let message = ChannelId(CHANNEL_ID.clone())
         .send_message(&ctx, |m| {
             m.content(RoleId(NOTIFICATION_ROLE_ID.clone()).mention());
@@ -319,155 +375,4 @@ pub async fn notify_discord(ctx: &Context, crab: Option<EorzeaDateTime>, cassie:
     if let Err(why) = message {
         eprintln!("Error sending discord notification: {:?}", why);
     };
-}
-
-fn notify_os(timesleep: TimeSleep, crab: Option<EorzeaDateTime>, cassie: Option<EorzeaDateTime>) {
-
-    if let Some(dt) = crab {
-        let length = match timesleep {
-            TimeSleep::OneCycle => format!("{}", HumanTime::from(dt.to_utc())),
-            TimeSleep::FiveMinutes => "in 5 minutes".into(),
-            TimeSleep::ThirtySeconds => "in 30 seconds".into(),
-            TimeSleep::Now => "now".into(),
-        };
-        Notification::new()
-            .app_id("com.squirrel.XIVLauncher.XIVLauncher")
-            .summary("Crab")
-            .body(&format!("{length}"))
-            .sound_name("Default")
-            .show()
-            .expect("failed to open OS notification");
-    }
-
-    if let Some(dt) = cassie {
-        let length = match timesleep {
-            TimeSleep::OneCycle => format!("{}", HumanTime::from(dt.to_utc())),
-            TimeSleep::FiveMinutes => "in 5 minutes".into(),
-            TimeSleep::ThirtySeconds => "in 30 seconds".into(),
-            TimeSleep::Now => "now".into(),
-        };
-        Notification::new()
-            .app_id("com.squirrel.XIVLauncher.XIVLauncher")
-            .summary("Cassie")
-            .body(&format!("{length}"))
-            .sound_name("Default")
-            .show()
-            .expect("failed to open OS notification");
-    }
-}
-
-fn is_hotbox_weather(weather: EorzeaWeather) -> bool {
-    weather.name == "Snow" || weather.name == "Blizzards" || weather.name == "Umbral Wind"
-}
-
-fn hotbox_farm(mut now: EorzeaDateTime) -> (EorzeaDateTime, usize) {
-    let zone = EorzeaMap::from_name("Eureka Pyros").expect("Could not find map");
-
-    // Start search next weather
-    now += Duration::hours(8);
-
-    let mut count;
-    loop {
-        // Find next hotbox weather
-        while !is_hotbox_weather(zone.weather(now)) {
-            now += Duration::hours(8);
-        }
-
-        count = 1;
-        let mut future = now + Duration::hours(8);
-
-        // Count total back-to-back hotbox weathers
-        while is_hotbox_weather(zone.weather(future)) {
-            count += 1;
-            future += Duration::hours(8);
-        }
-
-        // Break once we have multiple good weathers
-        if count > 1 {
-            break;
-        }
-
-        now += Duration::hours(8);
-    }
-    (now, count)
-}
-
-fn offensive_farm(mut now: EorzeaDateTime) -> (EorzeaDateTime, usize) {
-    let zone = EorzeaMap::from_name("Eureka Hydatos").expect("Could not find map");
-
-    // Start search next weather
-    now += Duration::hours(8);
-
-    let mut count;
-    loop {
-        // Find next hotbox weather
-        while zone.weather(now).name != "Snow" {
-            now += Duration::hours(8);
-        }
-
-        count = 1;
-        let mut future = now + Duration::hours(8);
-
-        // Count total back-to-back hotbox weathers
-        while zone.weather(future).name == "Snow" {
-            count += 1;
-            future += Duration::hours(8);
-        }
-
-        // Break once we have multiple good weathers
-        if count > 1 {
-            break;
-        }
-
-        now += Duration::hours(8);
-    }
-    (now, count)
-}
-
-fn speed_belt(mut now: EorzeaDateTime) -> EorzeaDateTime {
-    let zone = EorzeaMap::from_name("Eureka Pagos").expect("Could not find map");
-
-    // Find next non-Fog
-    while zone.weather(now).name == "Fog" {
-        now += Duration::hours(8);
-    }
-    let mut future = now + Duration::hours(8);
-
-    // Fog after is our target
-    while zone.weather(future).name != "Fog" {
-        future += Duration::hours(8);
-    }
-    future
-}
-
-fn cassie_earring(mut now: EorzeaDateTime) -> EorzeaDateTime {
-    let zone = EorzeaMap::from_name("Eureka Pagos").expect("Could not find map");
-
-    // Find next non-Blizzards
-    while zone.weather(now).name == "Blizzards" {
-        now += Duration::hours(8);
-    }
-    let mut future = now + Duration::hours(8);
-
-    // Blizzards after is our target
-    while zone.weather(future).name != "Blizzards" {
-        future += Duration::hours(8);
-    }
-    future
-}
-
-fn skoll_claw(mut now: EorzeaDateTime) -> EorzeaDateTime {
-    let zone = EorzeaMap::from_name("Eureka Pyros").expect("Could not find map");
-
-    // Find next non-Blizzards
-    while zone.weather(now).name == "Blizzards" {
-        now += Duration::hours(8);
-    }
-    let mut future = now + Duration::hours(8);
-
-    // Blizzards after is our target
-    while zone.weather(future).name != "Blizzards" {
-        future += Duration::hours(8);
-    }
-    future
 }

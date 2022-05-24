@@ -36,7 +36,7 @@ impl EorzeaWeather {
 pub struct EorzeaMap {
     name: String,
     id: usize,
-    weathers: Vec<WeatherRate>,
+    pub weathers: Vec<WeatherRate>,
 }
 
 impl EorzeaMap {
