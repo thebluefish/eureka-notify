@@ -1,25 +1,22 @@
+use super::APP_ID;
 use eureka_notify::prelude::*;
 use chrono::{Duration, Utc};
 use tokio::time::sleep;
 use tracing::*;
-use tracing_subscriber;
 use notify_rust::Notification;
 use chrono_humanize::HumanTime;
 
 enum TimeSleep {
     OneCycle,
     FiveMinutes,
-    ThirtySeconds,
+    OneMinute,
     Now,
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt().with_max_level(Level::INFO).init();
+pub async fn run_loop() {
+    info!("Starting eureka loop");
 
-    info!("Starting main loop");
-
-    let mut now = EorzeaDateTime::now().truncated(Duration::hours(8));
+    let mut now = DateTimeEorzea::now().truncated(Duration::hours(8));
 
     loop {
         let future = now + Duration::hours(8);
@@ -45,11 +42,11 @@ async fn main() -> anyhow::Result<()> {
                 notify_os(TimeSleep::FiveMinutes, crab, cassie, skoll);
             }
 
-            // Wait until 30 seconds before the next cycle to send another notification
-            if let Ok(duration) = ((future.to_utc() - Duration::seconds(30)) - Utc::now()).to_std() {
-                info!("sleep for {:?} to 30-second notification", duration);
+            // Wait to send another notification
+            if let Ok(duration) = ((future.to_utc() - Duration::minutes(1)) - Utc::now()).to_std() {
+                info!("sleep for {:?} to 1-min notification", duration);
                 sleep(duration).await;
-                notify_os(TimeSleep::ThirtySeconds, crab, cassie, skoll);
+                notify_os(TimeSleep::OneMinute, crab, cassie, skoll);
             }
         }
 
@@ -64,20 +61,18 @@ async fn main() -> anyhow::Result<()> {
 
         now = future;
     }
-
-    Ok(())
 }
 
-fn notify_os(timesleep: TimeSleep, crab: Option<EorzeaDateTime>, cassie: Option<EorzeaDateTime>, skoll: Option<EorzeaDateTime>) {
+fn notify_os(timesleep: TimeSleep, crab: Option<DateTimeEorzea>, cassie: Option<DateTimeEorzea>, skoll: Option<DateTimeEorzea>) {
     if let Some(dt) = crab {
         let length = match timesleep {
             TimeSleep::OneCycle => format!("{}", HumanTime::from(dt.to_utc())),
             TimeSleep::FiveMinutes => "in 5 minutes".into(),
-            TimeSleep::ThirtySeconds => "in 30 seconds".into(),
+            TimeSleep::OneMinute => "in 1 minute".into(),
             TimeSleep::Now => "now".into(),
         };
         Notification::new()
-            .app_id("com.squirrel.XIVLauncher.XIVLauncher")
+            .app_id(APP_ID)
             .summary("Crab")
             .body(&format!("{length}"))
             .sound_name("Default")
@@ -89,11 +84,11 @@ fn notify_os(timesleep: TimeSleep, crab: Option<EorzeaDateTime>, cassie: Option<
         let length = match timesleep {
             TimeSleep::OneCycle => format!("{}", HumanTime::from(dt.to_utc())),
             TimeSleep::FiveMinutes => "in 5 minutes".into(),
-            TimeSleep::ThirtySeconds => "in 30 seconds".into(),
+            TimeSleep::OneMinute => "in 1 minute".into(),
             TimeSleep::Now => "now".into(),
         };
         Notification::new()
-            .app_id("com.squirrel.XIVLauncher.XIVLauncher")
+            .app_id(APP_ID)
             .summary("Cassie")
             .body(&format!("{length}"))
             .sound_name("Default")
@@ -105,11 +100,11 @@ fn notify_os(timesleep: TimeSleep, crab: Option<EorzeaDateTime>, cassie: Option<
         let length = match timesleep {
             TimeSleep::OneCycle => format!("{}", HumanTime::from(dt.to_utc())),
             TimeSleep::FiveMinutes => "in 5 minutes".into(),
-            TimeSleep::ThirtySeconds => "in 30 seconds".into(),
+            TimeSleep::OneMinute => "in 30 seconds".into(),
             TimeSleep::Now => "now".into(),
         };
         Notification::new()
-            .app_id("com.squirrel.XIVLauncher.XIVLauncher")
+            .app_id(APP_ID)
             .summary("Skoll")
             .body(&format!("{length}"))
             .sound_name("Default")

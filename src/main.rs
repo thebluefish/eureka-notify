@@ -1,8 +1,10 @@
 use std::collections::HashMap;
 use std::env;
 use std::fmt::{Display, Formatter};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use eureka_notify::{prelude::*, discord::*};
 use chrono::{Duration, Utc};
 use chrono_humanize::HumanTime;
 use derive_more::{Deref, DerefMut};
@@ -32,89 +34,18 @@ use tokio::time::sleep;
 use tracing::*;
 use tracing_subscriber;
 
-use eureka_notify::prelude::*;
-
 // Globals loaded from environment vars
 lazy_static! {
     pub static ref DISCORD_TOKEN: String = env::var("DISCORD_TOKEN").expect("Expected DISCORD_TOKEN in env");
-    pub static ref DB: Mutex<PickleDb> = Mutex::new(PickleDb::load("data.db", PickleDbDumpPolicy::DumpUponRequest, SerializationMethod::Json).unwrap_or_else(|_| PickleDb::new("data.db", PickleDbDumpPolicy::DumpUponRequest, SerializationMethod::Json)));
-    // pub static ref NOTIFICATION_ROLE_ID: u64 = env::var("NOTIFICATION_ROLE_ID").expect("Expected NOTIFICATION_ROLE_ID in env").parse().expect("Invalid NOTIFICATION_ROLE_ID");
-    // pub static ref CHANNEL_ID: u64 = env::var("CHANNEL_ID").expect("Expected CHANNEL_ID in env").parse().expect("Invalid CHANNEL_ID");
+    pub static ref DB: Arc<Mutex<PickleDb>> = Arc::new(Mutex::new(PickleDb::load("data.db", PickleDbDumpPolicy::DumpUponRequest, SerializationMethod::Json).unwrap_or_else(|_| PickleDb::new("data.db", PickleDbDumpPolicy::DumpUponRequest, SerializationMethod::Json))));
 }
 
-#[derive(Default, Deref, DerefMut)]
-struct Handler(AtomicBool);
-
-#[derive(serde::Serialize, serde::Deserialize, Debug)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Default)]
 pub struct GuildItem {
-    ping_id: Option<u64>,
-    posts: Vec<(u64, i64)>,
-}
-
-enum TimeSleep {
-    OneCycle,
-    FiveMinutes,
-    ThirtySeconds,
-    Now,
-}
-
-impl Display for TimeSleep {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        match self {
-            TimeSleep::OneCycle => f.write_str("in 23 minutes"),
-            TimeSleep::FiveMinutes => f.write_str("in 5 minutes"),
-            TimeSleep::ThirtySeconds => f.write_str("in 30 seconds"),
-            TimeSleep::Now => f.write_str("now"),
-        }
-    }
-}
-
-#[async_trait]
-impl EventHandler for Handler {
-    async fn ready(&self, ctx: Context, _state: Ready) {
-        // Trigger the main loop to start on first load
-        if !self.load(Ordering::Relaxed) {
-            self.swap(true, Ordering::Relaxed);
-
-            tokio::spawn(run_main_loop(ctx));
-        }
-    }
-}
-
-#[group]
-// This requires us to call commands in this group
-#[prefixes("ross", "br")]
-#[only_in(guilds)]
-#[summary = "Ross commands"]
-// Sets a command that will be executed if only a group-prefix was passed.
-#[commands(cat, dog)]
-struct Ross;
-
-#[command]
-#[description = "Sets the ID to ping on near-future events"]
-#[bucket = "ross"]
-#[sub_commands(sub)]
-#[required_permissions("ADMINISTRATOR")]
-async fn ping(ctx: &Context, msg: &Message) -> CommandResult {
-    msg.react("white_check_mark");
-    Ok(())
-}
-
-#[command("set")]
-#[description("Sets the ID to ping")]
-async fn ping_set(ctx: &Context, msg: &Message, _args: Args) -> CommandResult {
-    msg.reply(&ctx.http, "This is a sub function!").await?;
-
-    Ok(())
-}
-
-#[command("stop")]
-#[aliases("clear", "remove")]
-#[description("Clears the ping ID, stopping the bot from pinging anyone")]
-async fn ping_clear(ctx: &Context, msg: &Message, _args: Args) -> CommandResult {
-    msg.reply(&ctx.http, "This is a sub function!").await?;
-
-    Ok(())
+    pub channel_id: Option<u64>,
+    pub role_id: Option<u64>,
+    pub posts: Vec<(u64, i64)>,
+    pub notifications: Vec<u64>,
 }
 
 #[tokio::main]
@@ -125,8 +56,25 @@ async fn main() -> anyhow::Result<()> {
         error!("failed to load .env file: {e}");
     }
 
-    let mut client = Client::builder(&*DISCORD_TOKEN, GatewayIntents::GUILD_MESSAGES)
-        .event_handler(Handler(false.into()))
+    let framework = StandardFramework::new()
+        .configure(|c| c
+            .with_whitespace(true)
+            .prefix("^")
+            .delimiters(vec![", ", ","])
+        )
+        // Set a function that's called whenever a command's execution didn't complete for one
+        // reason or another. For example, when a user has exceeded a rate-limit or a command
+        // can only be performed by the bot owner.
+        .before(before)
+        .on_dispatch_error(dispatch_error)
+        .bucket("ross", |b| b.delay(2)).await
+        .group(&ROSS_GROUP);
+
+    let intents = GatewayIntents::GUILD_MESSAGES | GatewayIntents::GUILD_MESSAGE_REACTIONS | GatewayIntents::MESSAGE_CONTENT;
+    let mut client = Client::builder(&*DISCORD_TOKEN, intents)
+        .event_handler(DiscordHandler(false.into()))
+        .framework(framework)
+        .type_map_insert::<DataStore>(DataStore(DB.clone()))
         .await
         .expect("Failed to create client")
         ;
@@ -139,240 +87,291 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
+#[group]
+// This requires us to call commands in this group
+#[prefixes("ross", "br")]
+#[only_in(guilds)]
+#[summary = "Ross commands"]
+// Sets a command that will be executed if only a group-prefix was passed.
+#[commands(notify, ping)]
+pub struct Ross;
+
+#[derive(Default, Deref, DerefMut)]
+struct DiscordHandler(AtomicBool);
+
+#[async_trait]
+impl EventHandler for DiscordHandler {
+    async fn ready(&self, ctx: Context, _state: Ready) {
+        // Trigger the main loop to start on first load
+        if !self.load(Ordering::Relaxed) {
+            self.swap(true, Ordering::Relaxed);
+
+            tokio::spawn(run_main_loop(ctx));
+        }
+    }
+}
+
 async fn run_main_loop(ctx: Context) {
     info!("Starting main loop");
 
     // Start either where we left off previously or now
     let mut skip_first_tick = false;
-    let mut now = EorzeaDateTime::now().truncated(Duration::hours(8));
-    let catch_up = now;
+    let mut now = DateTimeEorzea::now().truncated(Duration::hours(8));
+
     if let Some(db_now) = DB.lock().await.get("now") {
         if db_now < now.timestamp() {
-            now = EorzeaDateTime::from_timestamp(db_now) + Duration::hours(8);
+            now = DateTimeEorzea::from_timestamp(db_now) + Duration::hours(8);
         } else { // if we already ran the current frame, sleep until the next one
             skip_first_tick = true;
         }
     }
 
-    let mut guilds: HashMap<u64, GuildItem> = DB.lock().await.get("posts").unwrap_or(HashMap::new());
-
     loop {
         let future = now + Duration::hours(8);
 
-        let crab = crab_status(now);
-        let crabb = if crab == future { Some(crab) } else { None };
+        let crab = crab_status(now, Direction::Future);
+        let crab = if crab == future { Some(crab) } else { None };
 
-        let cassie = cassie_status(now);
-        let cassiee = if cassie == future { Some(cassie) } else { None };
+        let cassie = cassie_status(now, Direction::Future);
+        let cassie = if cassie == future { Some(cassie) } else { None };
 
-        // let (hotbox, hotbox_count) = hotbox_farm(now);
-        // let hotboxx = if hotbox == future { Some((hotbox, hotbox_count)) } else { None };
-        //
-        // let (offensive, offensive_count) = offensive_farm(now);
-        // let offensivee = if offensive == future { Some((offensive, offensive_count)) } else { None };
+        let skoll = skoll_status(now, Direction::Future);
+        let skoll = if skoll == future { Some(skoll) } else { None };
+
+        let do_notify = crab.is_some() || cassie.is_some() || skoll.is_some();
 
         if skip_first_tick {
             info!("skipping same tick");
             skip_first_tick = false;
         } else {
-            for (guild_id, GuildItem { ping_id, mut posts }) in guilds {
+            let mut db = DB.lock().await;
+            let mut guilds: HashMap<u64, GuildItem> = db.get("guilds").unwrap_or(HashMap::new());
 
-                // Post updates
-                let post_id = post_discord(&ctx, now).await;
+            for (_, guild) in guilds.iter_mut() {
+                if let Some(channel_id) = guild.channel_id {
+                    // Post updates
+                    let post_id = post_discord(&ctx, channel_id, guild.role_id, now).await;
 
-                // Send notifications for up to 1 weather cycle
-                if future > catch_up && (crabb.is_some() || cassiee.is_some()/* || hotboxx.is_some() || offensivee.is_some()*/) {
-                    notify_os(TimeSleep::OneCycle, crabb, cassiee/*, hotboxx, offensivee*/);
-                }
+                    // Clean up historical posts
+                    for (id, timestamp) in guild.posts.drain(..) {
+                        edit_post(&ctx, channel_id, id, DateTimeEorzea::from_timestamp(timestamp)).await;
+                    }
 
-                // Clean up historical posts
-                for (id, timestamp) in posts.drain(..) {
-                    edit_post(&ctx, id, EorzeaDateTime::from_timestamp(timestamp)).await;
-                }
+                    // Clean up historical notifications
+                    for id in guild.notifications.drain(..) {
+                        edit_notification(&ctx, channel_id, id, now).await;
+                    }
 
-                // Push this post to history
-                if let Some(id) = post_id {
-                    posts.push((id, now.timestamp()));
+                    // Push this post to history
+                    if let Some(id) = post_id {
+                        guild.posts.push((id, now.timestamp()));
+                    }
                 }
             }
 
-            let mut db = DB.lock().await;
-            db.set("posts", &past_posts).unwrap();
+            db.set("guilds", &guilds).unwrap();
             db.set("now", &(now.timestamp())).unwrap();
             db.dump().expect("failed to save db");
 
             info!("Completed tick for {}", now.to_utc());
         }
 
-        // Wait until 5 minutes before the next cycle to send another notification
-        if future > catch_up && (crabb.is_some() || cassiee.is_some()/* || hotboxx.is_some() || offensivee.is_some()*/) {
+        // Wait until 5 minutes before the next cycle to send a notification
+        if do_notify {
             if let Ok(duration) = ((future.to_utc() - Duration::minutes(5)) - Utc::now()).to_std() {
                 info!("sleep for {:?} to 5-minute notification", duration);
                 sleep(duration).await;
 
-                notify_os(TimeSleep::FiveMinutes, crabb, cassiee/*, hotboxx, offensivee*/);
+                let mut db = DB.lock().await;
+                let mut guilds: HashMap<u64, GuildItem> = db.get("guilds").unwrap_or(HashMap::new());
+
+                for (_, guild) in guilds.iter_mut() {
+                    if let Some(channel_id) = guild.channel_id {
+                        // Push this post to history
+                        if let Some(id) = notify_discord(&ctx, channel_id, guild.role_id, now).await {
+                            guild.notifications.push(id);
+                        }
+                    }
+                }
             }
         }
 
-        // Wait until 30 seconds before the next cycle to send another notification
-        if future > catch_up && (crabb.is_some() || cassiee.is_some()/* || hotboxx.is_some() || offensivee.is_some()*/) {
-            if let Ok(duration) = ((future.to_utc() - Duration::seconds(30)) - Utc::now()).to_std() {
-                info!("sleep for {:?} to 30-second notification", duration);
-                sleep(duration).await;
-
-                notify_os(TimeSleep::ThirtySeconds, crabb, cassiee/*, hotboxx, offensivee*/);
-            }
-        }
-
+        // Wait until next cycle
         if let Ok(duration) = (future.to_utc() - Utc::now()).to_std() {
             info!("sleep for {:?} to next weather", duration);
             sleep(duration).await;
         }
 
-        // if crabb.is_some() || cassiee.is_some()/* || hotboxx.is_some() || offensivee.is_some()*/ {
-        //     notify_os(TimeSleep::Now, crabb, cassiee/*, hotboxx, offensivee*/);
-        // }
-
         now = future;
     }
 }
 
-pub async fn edit_post(ctx: &Context, id: u64, now: EorzeaDateTime) {
-    let pagos = EorzeaMap::from_name("Eureka Pagos").expect("Could not find map");
-    let pyros = EorzeaMap::from_name("Eureka Pyros").expect("Could not find map");
-    let hydatos = EorzeaMap::from_name("Eureka Hydatos").expect("Could not find map");
-    let past = now - Duration::hours(8);
-    let future = now + Duration::hours(8);
+#[hook]
+async fn before(ctx: &Context, msg: &Message, command_name: &str) -> bool {
+    msg.react(ctx, '✅').await.ok();
 
-    // We will post the next crab timer when this is crab weather *or* crab weather is next
-    let crab_time = crab_status(now);
-    let crab = if crab_status(past) == now || crab_time == future { Some(crab_time) } else { None };
-
-    let cassie_time = cassie_status(now);
-    let cassie = if cassie_status(past) == now || cassie_time == future { Some(cassie_time) } else { None };
-
-    let past_crab = crab_status(past) == now;
-    let past_cassie = cassie_status(past) == now;
-
-    let result = ChannelId(CHANNEL_ID.clone()).edit_message(&ctx, id, |m| {
-        m.content("");
-        if past_crab || past_cassie {
-            m.add_embed(|e| {
-                e
-                    .field(format!("Crab <t:{}:R>", crab_time.to_utc().timestamp()), format!("<t:{}>", crab_time.to_utc().timestamp()), true)
-                    .field(format!("Cassie <t:{}:R>", cassie_time.to_utc().timestamp()), format!("<t:{}>", cassie_time.to_utc().timestamp()), true)
-            });
-        } else if crab.is_some() || cassie.is_some() {
-            m.add_embed(|e| {
-                if let Some(crab) = crab {
-                    e.field(format!("Crab <t:{}:R>", crab.to_utc().timestamp()), format!("<t:{}>", crab.to_utc().timestamp()), true);
-                }
-                if let Some(cassie) = cassie {
-                    e.field(format!("Cassie <t:{}:R>", cassie.to_utc().timestamp()), format!("<t:{}>", cassie.to_utc().timestamp()), true);
-                }
-                e
-            });
-        }
-        m.add_embed(|e| {
-            e
-                .field(format!("Pagos: {}", pagos.weather(now)), format!("Next: {}", pagos.weather(future)), true)
-                .field(format!("Pyros: {}", pyros.weather(now)), format!("Next: {}", pyros.weather(future)), true)
-                .field(format!("Hydatos: {}", hydatos.weather(now)), format!("Next: {}", hydatos.weather(future)), true)
-                .field(format!("<t:{}:R>", now.to_utc().timestamp()), format!("<t:{}>", now.to_utc().timestamp()), false)
-        });
-        m
-    }).await;
-    if let Err(err) = result {
-        eprintln!("Error editing discord post: {err:?}");
-    };
+    true
 }
 
-/// Create the discord log for this weather cycle
-pub async fn post_discord(ctx: &Context, now: EorzeaDateTime) -> Option<u64> {
-    let pagos = EorzeaMap::from_name("Eureka Pagos").expect("Could not find map");
-    let pyros = EorzeaMap::from_name("Eureka Pyros").expect("Could not find map");
-    let hydatos = EorzeaMap::from_name("Eureka Hydatos").expect("Could not find map");
-    let past = now - Duration::hours(8);
-    let future = now + Duration::hours(8);
+#[command]
+#[description = "Explains the current notification configuration"]
+#[bucket = "ross"]
+#[sub_commands(notify_set, notify_clear)]
+#[required_permissions("ADMINISTRATOR")]
+pub async fn notify(ctx: &Context, msg: &Message) -> CommandResult {
+    let mut data = ctx.data.write().await;
+    let db = data.get_mut::<DataStore>().unwrap().lock().await;
+    let guilds = db.get::<HashMap<u64, GuildItem>>("guilds").unwrap_or(HashMap::new());
+    let guild = guilds.get(&msg.guild_id.unwrap().0);
 
-    // We will post the next crab timer when this is crab weather *or* crab weather is next
-    let crab_time = crab_status(now);
-    let crab = if crab_status(past) == now || crab_time == future { Some(crab_time) } else { None };
-
-    let cassie_time = cassie_status(now);
-    let cassie = if cassie_status(past) == now || cassie_time == future { Some(cassie_time) } else { None };
-
-    let past_crab = crab_status(past) == now;
-    let past_cassie = cassie_status(past) == now;
-
-    let message = ChannelId(CHANNEL_ID.clone())
-        .send_message(&ctx, |m| {
-            // Notify when futures are near
-            if crab_time == future || cassie_time == future {
-                m.content(RoleId(NOTIFICATION_ROLE_ID.clone()).mention());
+    let mut success = false;
+    if let Some(guild) = guild {
+        if let Some(channel_id) = guild.channel_id {
+            if let Ok(channels) = msg.guild_id.unwrap().channels(&ctx).await {
+                if let Some(channel) = channels.get(&ChannelId(channel_id)) {
+                    msg.reply(&ctx.http, format!("Posting in {channel}")).await?;
+                    success = true;
+                }
             }
-            if past_crab || past_cassie {
-                m.add_embed(|e| {
-                    e
-                        .field(format!("Crab <t:{}:R>", crab_time.to_utc().timestamp()), format!("<t:{}>", crab_time.to_utc().timestamp()), true)
-                        .field(format!("Cassie <t:{}:R>", cassie_time.to_utc().timestamp()), format!("<t:{}>", cassie_time.to_utc().timestamp()), true)
-                });
-            } else if crab.is_some() || cassie.is_some() {
-                m.add_embed(|e| {
-                    if let Some(crab) = crab {
-                        e.field(format!("Crab <t:{}:R>", crab.to_utc().timestamp()), format!("<t:{}>", crab.to_utc().timestamp()), true);
-                    }
-                    if let Some(cassie) = cassie {
-                        e.field(format!("Cassie <t:{}:R>", cassie.to_utc().timestamp()), format!("<t:{}>", cassie.to_utc().timestamp()), true);
-                    }
-                    e
-                });
-            }
-            m.add_embed(|e| {
-                e
-                    .field(format!("Pagos: {}", pagos.weather(now)), format!("Next: {}", pagos.weather(future)), true)
-                    .field(format!("Pyros: {}", pyros.weather(now)), format!("Next: {}", pyros.weather(future)), true)
-                    .field(format!("Hydatos: {}", hydatos.weather(now)), format!("Next: {}", hydatos.weather(future)), true)
-                    .field(format!("Next <t:{}:R>", future.to_utc().timestamp()), format!("Started <t:{}:R>", now.to_utc().timestamp()), false)
-            });
-            m
-        })
-        .await;
-
-    match message {
-        Ok(msg) => Some(msg.id.0),
-        Err(err) => {
-            error!("Error sending message: {err:?}");
-            None
         }
     }
+
+    if !success {
+        msg.reply(&ctx.http, format!("Not currently set to post updates.\nUse `^ross notify set` to set the current channel")).await?;
+    }
+
+    Ok(())
 }
 
-pub async fn notify_discord(ctx: &Context, crab: Option<EorzeaDateTime>, cassie: Option<EorzeaDateTime>,
-                            /*hotbox: Option<(EorzeaDateTime, usize)>, offensive: Option<(EorzeaDateTime, usize)>*/) {
-    let message = ChannelId(CHANNEL_ID.clone())
-        .send_message(&ctx, |m| {
-            m.content(RoleId(NOTIFICATION_ROLE_ID.clone()).mention());
-            m.add_embed(|e| {
-                if let Some(crab) = crab {
-                    e.field(format!("Crab <t:{}:R>", crab.to_utc().timestamp()), format!("<t:{}>", crab.to_utc().timestamp()), false);
-                };
-                if let Some(cassie) = cassie {
-                    e.field(format!("Cassie <t:{}:R>", cassie.to_utc().timestamp()), format!("<t:{}>", cassie.to_utc().timestamp()), false);
-                }
-                // if let Some((hotbox, hotbox_count)) = hotbox {
-                //     e.field(format!("Hotbox x{} <t:{}:R>", hotbox_count, hotbox.to_utc().timestamp()), format!("<t:{}>", hotbox.to_utc().timestamp()), false);
-                // }
-                // if let Some((offensive, offensive_count)) = offensive {
-                //     e.field(format!("Offensive x{} <t:{}:R>", offensive_count, offensive.to_utc().timestamp()), format!("<t:{}>", offensive.to_utc().timestamp()), false);
-                // }
-                e
-            });
-            m
-        })
-        .await;
+#[command("set")]
+#[description("Sets the channel to post updates")]
+pub async fn notify_set(ctx: &Context, msg: &Message, _args: Args) -> CommandResult {
+    let mut data = ctx.data.write().await;
+    let mut db = data.get_mut::<DataStore>().unwrap().lock().await;
+    let mut guilds = db.get::<HashMap<u64, GuildItem>>("guilds").unwrap_or(HashMap::new());
+    let mut guild = guilds.entry(msg.guild_id.unwrap().0).or_insert(Default::default());
 
-    if let Err(why) = message {
-        eprintln!("Error sending discord notification: {:?}", why);
+    guild.channel_id = Some(msg.channel_id.0);
+
+    db.set("guilds", &guilds).unwrap();
+    db.dump().expect("failed to save db");
+
+    msg.reply(&ctx.http, format!("Will now post updates in this channel")).await?;
+
+    Ok(())
+}
+
+#[command("stop")]
+#[aliases("clear", "remove")]
+#[description("Clears the notification ID, stopping the bot from posting updates")]
+pub async fn notify_clear(ctx: &Context, msg: &Message, _args: Args) -> CommandResult {
+    let mut data = ctx.data.write().await;
+    let mut db = data.get_mut::<DataStore>().unwrap().lock().await;
+    let mut guilds = db.get::<HashMap<u64, GuildItem>>("guilds").unwrap_or(HashMap::new());
+    let mut guild = guilds.entry(msg.guild_id.unwrap().0).or_insert(Default::default());
+
+    guild.channel_id = None;
+
+    db.set("guilds", &guilds).unwrap();
+    db.dump().expect("failed to save db");
+
+    msg.reply(&ctx.http, format!("No longer sending updates")).await?;
+
+    Ok(())
+}
+
+#[command]
+#[description = "Explains the current mention configuration"]
+#[bucket = "ross"]
+#[sub_commands(ping_set, ping_clear)]
+#[required_permissions("ADMINISTRATOR")]
+pub async fn ping(ctx: &Context, msg: &Message) -> CommandResult {
+    let mut data = ctx.data.write().await;
+    let db = data.get_mut::<DataStore>().unwrap().lock().await;
+    let guilds = db.get::<HashMap<u64, GuildItem>>("guilds").unwrap_or(HashMap::new());
+    let guild = guilds.get(&msg.guild_id.unwrap().0);
+
+    let mut success = false;
+    if let Some(guild) = guild {
+        if let Some(role_id) = guild.role_id {
+            if let Ok(roles) = msg.guild_id.unwrap().roles(&ctx).await {
+                if let Some(role) = roles.get(&RoleId(role_id)) {
+                    msg.reply(&ctx.http, format!("Will ping `@{}`", role.name)).await?;
+                    success = true;
+                }
+            }
+        }
+    }
+
+    if !success {
+        msg.reply(&ctx.http, format!("Not currently set to ping.\nUse `^ross ping set <id>` to set a role")).await?;
+    }
+
+    Ok(())
+}
+
+#[command("set")]
+#[description("Sets the ID to ping")]
+pub async fn ping_set(ctx: &Context, msg: &Message, mut args: Args) -> CommandResult {
+    let role_id = args.single::<u64>()?;
+
+    let mut data = ctx.data.write().await;
+    let mut db = data.get_mut::<DataStore>().unwrap().lock().await;
+    let mut guilds = db.get::<HashMap<u64, GuildItem>>("guilds").unwrap_or(HashMap::new());
+    let mut guild = guilds.entry(msg.guild_id.unwrap().0).or_insert(Default::default());
+
+    let mut role = None;
+    if let Ok(roles) = msg.guild_id.unwrap().roles(&ctx).await {
+        if let Some(r) = roles.get(&RoleId(role_id)) {
+            role = Some(r.clone());
+        }
+    }
+
+    guild.role_id = Some(role_id);
+
+    db.set("guilds", &guilds).unwrap();
+    db.dump().expect("failed to save db");
+
+    match role {
+        Some(role) => msg.reply(&ctx.http, format!("Will now ping {}", role)).await?,
+        None => msg.reply(&ctx.http, format!("Will try to ping <@{}>", role_id)).await?,
     };
+
+    Ok(())
+}
+
+#[command("stop")]
+#[aliases("clear", "remove")]
+#[description("Clears the ping ID, stopping the bot from pinging anyone")]
+pub async fn ping_clear(ctx: &Context, msg: &Message, _args: Args) -> CommandResult {
+    let mut data = ctx.data.write().await;
+    let mut db = data.get_mut::<DataStore>().unwrap().lock().await;
+    let mut guilds = db.get::<HashMap<u64, GuildItem>>("guilds").unwrap_or(HashMap::new());
+    let guild = guilds.get_mut(&msg.guild_id.unwrap().0);
+
+    let mut message = None;
+    if let Some(guild) = guild {
+        if let Some(role_id) = guild.role_id {
+            let mut worked = true;
+            if let Ok(roles) = msg.guild_id.unwrap().roles(&ctx).await {
+                if let Some(role) = roles.get(&RoleId(role_id)) {
+                    message = Some(format!("No longer pinging `{}`", role.name));
+                    worked = true;
+                }
+            }
+            if !worked {
+                message = Some(format!("No longer pinging `{}`", role_id));
+            }
+        }
+        guild.role_id = None;
+    }
+
+    db.set("guilds", &guilds).unwrap();
+    db.dump().expect("failed to save db");
+
+    if let Some(message) = message {
+        msg.reply(&ctx.http, message).await?;
+    }
+
+    Ok(())
 }

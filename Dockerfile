@@ -24,7 +24,7 @@ WORKDIR /app
 COPY ./ .
 
 # We no longer need to use the x86_64-unknown-linux-musl target
-RUN cargo build --release
+RUN cargo build --release --bin eureka-notify
 
 ####################################################################################################
 ## Final image
@@ -38,7 +38,7 @@ COPY --from=builder /etc/group /etc/group
 WORKDIR /app
 
 # Copy our build
-COPY --from=builder /myip/target/release/eureka-notify ./
+COPY --from=builder /app/target/release/eureka-notify ./
 
 # Use an unprivileged user.
 USER botross:botross

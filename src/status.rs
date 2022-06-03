@@ -1,61 +1,81 @@
-use crate::time::EorzeaDateTime;
+use crate::datetime_eorzea::DateTimeEorzea;
 use crate::weather::{EorzeaMap, EorzeaWeather};
 use chrono::Duration;
 
-pub fn crab_status(mut now: EorzeaDateTime) -> EorzeaDateTime {
+#[derive(Copy, Clone, Eq, PartialEq, Debug, Hash)]
+pub enum Direction {
+    Future,
+    Past,
+}
+
+impl Direction {
+    pub fn next(self, dt: DateTimeEorzea) -> DateTimeEorzea {
+        match self {
+            Direction::Future => dt + Duration::hours(8),
+            Direction::Past => dt - Duration::hours(8),
+        }
+    }
+}
+
+pub fn crab_status(mut now: DateTimeEorzea, direction: Direction) -> DateTimeEorzea {
     let zone = EorzeaMap::from_name("Eureka Pagos").expect("Could not find map");
 
     // Find next non-Fog
-    while zone.weather(now).name == "Fog" {
-        now += Duration::hours(8);
+    if direction == Direction::Future {
+        while zone.weather(now).name == "Fog" {
+            now = direction.next(now);
+        }
     }
-    let mut future = now + Duration::hours(8);
 
     // Fog after is our target
-    while zone.weather(future).name != "Fog" {
-        future += Duration::hours(8);
+    while zone.weather(now).name != "Fog" {
+        now = direction.next(now);
     }
-    future
+
+    now
 }
 
-pub fn cassie_status(mut now: EorzeaDateTime) -> EorzeaDateTime {
+pub fn cassie_status(mut now: DateTimeEorzea, direction: Direction) -> DateTimeEorzea {
     let zone = EorzeaMap::from_name("Eureka Pagos").expect("Could not find map");
 
     // Find next non-Blizzards
-    while zone.weather(now).name == "Blizzards" {
-        now += Duration::hours(8);
+    if direction == Direction::Future {
+        while zone.weather(now).name == "Blizzards" {
+            now = direction.next(now);
+        }
     }
-    let mut future = now + Duration::hours(8);
 
     // Blizzards after is our target
-    while zone.weather(future).name != "Blizzards" {
-        future += Duration::hours(8);
+    while zone.weather(now).name != "Blizzards" {
+        now = direction.next(now);
     }
-    future
+
+    now
 }
 
-pub fn skoll_status(mut now: EorzeaDateTime) -> EorzeaDateTime {
+pub fn skoll_status(mut now: DateTimeEorzea, direction: Direction) -> DateTimeEorzea {
     let zone = EorzeaMap::from_name("Eureka Pyros").expect("Could not find map");
 
     // Find next non-Blizzards
-    while zone.weather(now).name == "Blizzards" {
-        now += Duration::hours(8);
+    if direction == Direction::Future {
+        while zone.weather(now).name == "Blizzards" {
+            now = direction.next(now);
+        }
     }
-    let mut future = now + Duration::hours(8);
 
     // Blizzards after is our target
-    while zone.weather(future).name != "Blizzards" {
-        future += Duration::hours(8);
+    while zone.weather(now).name != "Blizzards" {
+        now = direction.next(now);
     }
-    future
-}
 
+    now
+}
 
 fn is_hotbox_weather(weather: EorzeaWeather) -> bool {
     weather.name == "Snow" || weather.name == "Blizzards" || weather.name == "Umbral Wind"
 }
 
-pub fn hotbox_status(mut now: EorzeaDateTime) -> (EorzeaDateTime, usize) {
+pub fn hotbox_status(mut now: DateTimeEorzea) -> (DateTimeEorzea, usize) {
     let zone = EorzeaMap::from_name("Eureka Pyros").expect("Could not find map");
 
     // Start search next weather
@@ -69,12 +89,12 @@ pub fn hotbox_status(mut now: EorzeaDateTime) -> (EorzeaDateTime, usize) {
         }
 
         count = 1;
-        let mut future = now + Duration::hours(8);
+        let mut next = now + Duration::hours(8);
 
         // Count total back-to-back hotbox weathers
-        while is_hotbox_weather(zone.weather(future)) {
+        while is_hotbox_weather(zone.weather(next)) {
             count += 1;
-            future += Duration::hours(8);
+            next += Duration::hours(8);
         }
 
         // Break once we have multiple good weathers
@@ -87,7 +107,7 @@ pub fn hotbox_status(mut now: EorzeaDateTime) -> (EorzeaDateTime, usize) {
     (now, count)
 }
 
-pub fn offensive_status(mut now: EorzeaDateTime) -> (EorzeaDateTime, usize) {
+pub fn offensive_status(mut now: DateTimeEorzea) -> (DateTimeEorzea, usize) {
     let zone = EorzeaMap::from_name("Eureka Hydatos").expect("Could not find map");
 
     // Start search next weather
@@ -101,12 +121,12 @@ pub fn offensive_status(mut now: EorzeaDateTime) -> (EorzeaDateTime, usize) {
         }
 
         count = 1;
-        let mut future = now + Duration::hours(8);
+        let mut next = now + Duration::hours(8);
 
         // Count total back-to-back hotbox weathers
-        while zone.weather(future).name == "Snow" {
+        while zone.weather(next).name == "Snow" {
             count += 1;
-            future += Duration::hours(8);
+            next += Duration::hours(8);
         }
 
         // Break once we have multiple good weathers
